@@ -75,7 +75,10 @@ class H3TwoStageSampler:
             "negative": ("CONDITIONING",),
             "latent_image": ("LATENT", {"tooltip": "From H3 Two-Stage Size (empty full-size AV latent; it also "
                                                    "carries lowres_scale)."}),
-            "sampler": ("SAMPLER", {"tooltip": "Plain euler only."}),
+            "sampler_name": (list(engine.SAMPLERS), {"default": "euler",
+                             "tooltip": "Only samplers that can be split in two. euler: ODE step (full models, "
+                                        "partial LoRA strengths). lcm: jump to the prediction and add fresh noise, "
+                                        "the rule few-step distilled LoRAs (DMAD at strength 1) were trained with."}),
             "sigmas": ("SIGMAS",),
             "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "control_after_generate": True}),
             "cfg": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 100.0, "step": 0.1, "round": 0.01}),
@@ -97,10 +100,10 @@ class H3TwoStageSampler:
     FUNCTION = "run"
     CATEGORY = "sampling/minimax"
 
-    def run(self, model, positive, negative, latent_image, sampler, sigmas, seed, cfg, split_step, lift, noise_keep,
-            model_low=None, **legacy):
+    def run(self, model, positive, negative, latent_image, sampler_name, sigmas, seed, cfg, split_step, lift,
+            noise_keep, model_low=None, **legacy):
         settings = engine.settings_from_latent(latent_image, split_step, lift, noise_keep, legacy)
-        return engine.sample(model, positive, negative, latent_image, sampler, sigmas, seed, cfg, settings,
+        return engine.sample(model, positive, negative, latent_image, sampler_name, sigmas, seed, cfg, settings,
                              model_low)
 
 

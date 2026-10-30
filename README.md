@@ -25,7 +25,8 @@ H3 Two-Stage Size ──latent────────────────�
                   └─width / height (instead of low_*, for clips with a pinned first/last frame)
 ```
 
-- Sampler: `euler` (KSamplerSelect), sigmas e.g. BasicScheduler `simple` 8 steps (+ an optional refiner step).
+- Sampler: chosen on the node (`euler` or `lcm`, no KSamplerSelect); sigmas e.g. BasicScheduler `simple` 8 steps
+  (+ an optional refiner step).
 - Reference-only clips: build the conditioning at the **low-res size**. References are sized by the conditioning
   node to its own width × height; at the low-res size each step is ~5–8 % faster with no visible difference.
 - Clips with a first/last frame: build the conditioning at the **full size** so keyframes are encoded at full
@@ -59,12 +60,12 @@ up as coloured edges) and the low-res side is exactly `lowres_scale` × the full
 | model | MODEL | | H3 model (with LoRA); full-res stage, and low-res stage unless `model_low` is set |
 | positive / negative | CONDITIONING | | From the H3 conditioning node |
 | latent_image | LATENT | | From H3 Two-Stage Size (must be empty; no noise mask). A plain empty latent also works (scale 0.75, old rounding) |
-| sampler | SAMPLER | | Plain `euler` only (other solvers carry history and cannot be split) |
+| sampler_name | combo | euler | Only samplers that can be split in two, i.e. that keep no history between steps: `euler` (ODE step along the prediction) and `lcm` (jump to the prediction, add fresh noise: the rule few-step distilled LoRAs such as DMAD were trained with). Multistep solvers are not offered |
 | sigmas | SIGMAS | | The full schedule |
 | seed | INT | 0 | Low-res noise; the re-noise at the hand-over uses seed + 1 |
 | cfg | FLOAT | 1.0 | As in KSampler |
 | split_step | INT | 6 | Steps at low resolution; the rest run at full resolution (at least one each side) |
-| lift | combo | `minimax_h3_latent_upscaler_3d_fp16.safetensors` | Any file in `models/latent_upscale_models/`, or `bilinear` (no model). Only 24-channel H3 upscalers load; others are refused with a clear message |
+| lift | combo | `minimax_h3_latent_upscaler_3d_fp16.safetensors` | Any file in `models/latent_upscale_models/`, or `bilinear` (no model). Only the MiniMax H3 upscaler loads; other models are refused with a clear message |
 | noise_keep | FLOAT | 0 | 0 = fresh noise at the hand-over (recommended). > 0 keeps the low frequencies of the low-res stage's own noise (exact orthonormal-FFT band split). It made no measurable difference in our tests |
 | model_low (optional) | MODEL | | Separate model for the low-res stage |
 
@@ -76,16 +77,16 @@ the time per step; the first line states the plan (sizes, steps, hand-over sigma
 ## Requirements
 
 - A ComfyUI build with native MiniMax H3 support (`comfy_extras/nodes_minimax_h3.py`).
-- For the learned lift: the plugin **[Comfyui_Minimax_h3_latent_Upscaler](https://github.com/LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler)**
-  by **LBH-123-AI**, installed next to this one in `custom_nodes/`, and its model weights
-  (e.g. `minimax_h3_latent_upscaler_3d_fp16.safetensors`) from
+- For the learned lift: a ComfyUI build with the native MiniMax H3 latent upscaler (ComfyUI PR #17412:
+  `comfy/ldm/minimax/latent_upscaler.py`, node "MiniMax H3 Latent Upscale With Model"), and the model weights
+  (e.g. `minimax_h3_latent_upscaler_3d_fp16.safetensors`, by LBH-123-AI) from
   [huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler](https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler)
   in `ComfyUI/models/latent_upscale_models/`. Without them only `lift = bilinear` works.
 
-The upscaler's architecture and loading code are **not** included here: this node imports them at run time from
-that plugin, which carries no license file, so its code and weights stay under its author's terms. Its authors
-credit [ComfyUi_NNLatentUpscale](https://github.com/Ttl/ComfyUi_NNLatentUpscale) by Ttl and the LTX 2.3 spatial
-upscaler as foundations.
+The sampler calls ComfyUI's own loader and upscale node internally, so nothing extra is wired and no third-party
+plugin is needed. Against the plugin it used before (Comfyui_Minimax_h3_latent_Upscaler) the result is the same to
+fp16 rounding (relative RMS difference 0.05 %) at lower peak VRAM (1.6 GB vs 2.0 GB for a 5 s 1792 × 1024 clip),
+because ComfyUI's version works in 16-frame slabs.
 
 ## Notes from testing (H3, 4-step LoRA, 8 + 1 steps)
 
@@ -94,6 +95,11 @@ upscaler as foundations.
   in one pass matches the chunked result.
 - Same seed, same settings: output is equivalent to the SelfLift H3 sampler (`rho = 0`).
 - `split_step` 4 / 5 / 6 of 8 gives near-identical clips; 6 is a little faster.
+- `lcm` vs `euler` with a 4-step LoRA at strength 0.4, 8 + 1 steps, split 6 (2 seeds): `lcm` runs cleanly through
+  the split but gives a different composition for the same seed, brighter tone (luma +4 to +9), about 1.5-2x the
+  texture flicker and a little less motion. At partial LoRA strength keep `euler`; `lcm` is meant for a distilled
+  LoRA at its own operating point (e.g. DMAD at strength 1, 4 steps).
+- Sampling is not bit-reproducible run to run: the same graph re-run gives PSNR ~26-28 dB with the same shot.
 - Layout depends on the starting noise, which depends on size and seed together: the same seed at another size
   gives another composition. Compare seeds at a fixed size.
 
@@ -109,11 +115,9 @@ python_embeded/python.exe -s -m pytest custom_nodes/ComfyUI-H3TwoStage/tests -q
 
 - [comfyui-SelfLift](https://github.com/facok/comfyui-SelfLift) (facok): the two-stage H3 sampling path this
   node streamlines. No code is copied from it.
-- [Comfyui_Minimax_h3_latent_Upscaler](https://github.com/LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler) and
-  [the model weights](https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler) (LBH-123-AI): the learned
-  3D latent upscaler, loaded from that plugin at run time.
+- [Minimax_h3_latent_Upscaler](https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler) (LBH-123-AI): the
+  learned 3D latent upscaler weights, run through ComfyUI's native implementation.
 
 ## License
 
-MIT for the code in this repository (see [LICENSE](LICENSE)). Third-party plugins and model weights it loads keep
-their own terms.
+MIT for the code in this repository (see [LICENSE](LICENSE)). Model weights it loads keep their own terms.

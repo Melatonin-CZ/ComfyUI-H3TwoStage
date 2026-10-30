@@ -1,7 +1,11 @@
 """Two-stage H3 sampling: low-res prefix -> latent lift -> re-noise -> full-res finish, one decode at the end.
 
-Audio is never lifted or re-noised: it takes its normal Euler step at the hand-over and continues on its own
-schedule (H3 carries audio scaled by sigma_v / sigma_a, so the AV pack is one ordinary flow latent).
+Audio is never lifted: at the hand-over it keeps the low-res stage's own last step (the sampler's rule) and continues
+on its own schedule (H3 carries audio scaled by sigma_v / sigma_a, so the AV pack is one ordinary flow latent).
+
+Only memoryless samplers can be split in two: each step may depend on the current latent and the model's prediction,
+never on earlier steps. Euler (an ODE step along the prediction) and LCM (jump to the prediction, add fresh noise:
+the rule few-step distilled LoRAs such as DMAD were trained with) qualify; multistep solvers keep history.
 """
 
 from __future__ import annotations
@@ -13,7 +17,6 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 
-import comfy.k_diffusion.sampling
 import comfy.model_management
 import comfy.model_sampling
 import comfy.nested_tensor
@@ -29,6 +32,7 @@ from . import sizes
 LOG = "[H3 two-stage]"
 META_KEY = "h3_two_stage"
 DEFAULT_SCALE = 0.75
+SAMPLERS = ("euler", "lcm")  # memoryless k-diffusion samplers, see the module docstring
 
 
 @dataclass(frozen=True)
@@ -60,12 +64,11 @@ def _pack(streams, nested):
     return comfy.nested_tensor.NestedTensor(streams) if nested else streams[0]
 
 
-def _validate(model, sampler, sigmas, latent_image, s: Settings) -> None:
+def _validate(model, sampler_name, sigmas, latent_image, s: Settings) -> None:
     if not isinstance(model.get_model_object("model_sampling"), comfy.model_sampling.CONST):
         raise ValueError(f"{LOG} needs a rectified-flow model (MiniMax H3)")
-    if not isinstance(sampler, comfy.samplers.KSAMPLER) or \
-            sampler.sampler_function is not comfy.k_diffusion.sampling.sample_euler:
-        raise ValueError(f"{LOG} only plain Euler can be split in two (other solvers keep history)")
+    if sampler_name not in SAMPLERS:
+        raise ValueError(f"{LOG} sampler '{sampler_name}' cannot be split in two; use one of {', '.join(SAMPLERS)}")
     if sigmas.ndim != 1 or sigmas.numel() < 3:
         raise ValueError(f"{LOG} needs a schedule of at least 2 steps")
     if not 1 <= s.split_step <= sigmas.numel() - 2:
@@ -145,9 +148,10 @@ class _StepLog:
         return self.preview(i + self.offset, x0, x, self.total)
 
 
-def sample(model, positive, negative, latent_image, sampler, sigmas, seed, cfg, s: Settings, model_low=None):
+def sample(model, positive, negative, latent_image, sampler_name, sigmas, seed, cfg, s: Settings, model_low=None):
     """Returns (result latent, low-res x0 latent, lifted latent) — the last two video only, for inspection."""
-    _validate(model, sampler, sigmas, latent_image, s)
+    _validate(model, sampler_name, sigmas, latent_image, s)
+    sampler = comfy.samplers.ksampler(sampler_name)
     model_low = model_low or model
     device = comfy.model_management.intermediate_device()
     streams, nested = _streams(comfy.sample.fix_empty_latent_channels(
@@ -161,9 +165,9 @@ def sample(model, positive, negative, latent_image, sampler, sigmas, seed, cfg, 
     k = s.split_step
     sigma_k, sigma_next = float(sigmas[k - 1]), float(sigmas[k])
     logging.info("%s plan target %dx%d low %dx%d (lift %.4f x %.4f) frames %d | low steps %d, full steps %d | "
-                 "hand-over predicts at sigma %.4f, resumes at %.4f | lift %s, noise_keep %.2f",
-                 LOG, W, H, w, h, W / w, H / h, t, k, sigmas.numel() - 1 - k, sigma_k, sigma_next, s.lift,
-                 s.noise_keep)
+                 "hand-over predicts at sigma %.4f, resumes at %.4f | sampler %s, lift %s, noise_keep %.2f",
+                 LOG, W, H, w, h, W / w, H / h, t, k, sigmas.numel() - 1 - k, sigma_k, sigma_next, sampler_name,
+                 s.lift, s.noise_keep)
     _check_reference_size(positive, (h, w))
 
     total = sigmas.numel() - 1
@@ -176,16 +180,18 @@ def sample(model, positive, negative, latent_image, sampler, sigmas, seed, cfg, 
                        [torch.zeros_like(x) for x in streams[1:]], nested)
     noise_low = comfy.sample.prepare_noise(low_latent, seed, batch_index)
     low_log = _StepLog("low", sigmas[:k + 1], model_low, 0, total, preview)
-    comfy.samplers.sample(model_low, noise_low, _resize_keyframes(positive, (h, w)),
-                          _resize_keyframes(negative, (h, w)), cfg, model_low.load_device, sampler,
-                          sigmas[:k + 1], model_low.model_options, latent_image=low_latent, callback=low_log,
-                          disable_pbar=no_bar, seed=seed)
+    low_out = comfy.samplers.sample(model_low, noise_low, _resize_keyframes(positive, (h, w)),
+                                    _resize_keyframes(negative, (h, w)), cfg, model_low.load_device, sampler,
+                                    sigmas[:k + 1], model_low.model_options, latent_image=low_latent,
+                                    callback=low_log, disable_pbar=no_bar, seed=seed)
     if low_log.count != k:
         raise RuntimeError(f"{LOG} expected {k} low-res steps, saw {low_log.count}")
     state, x0, _ = low_log.last
     state_streams, _ = _streams(state)
     x0_streams, _ = _streams(x0)
-    del low_latent, noise_low
+    # the low-res stage's last step already took audio to sigma_next by this sampler's own rule (latent format)
+    audio_resume = [x.to(device) for x in _streams(low_out)[0][1:]]
+    del low_latent, noise_low, low_out
 
     # 2. lift the predicted clean video
     t_lift = time.perf_counter()
@@ -193,22 +199,23 @@ def sample(model, positive, negative, latent_image, sampler, sigmas, seed, cfg, 
     x0_video_low = latent_format.process_out(x0_streams[0].float()).to(device)
     lifted = latent_format.process_in(lift_mod.lift(x0_video_low, (H, W), s.lift)).to(device)
 
-    # 3. re-noise video at the resume sigma; audio takes its ordinary Euler step
+    # 3. re-noise video at the resume sigma (fresh noise around the lifted prediction is itself an LCM step)
     fresh = comfy.sample.prepare_noise(lifted, (seed + 1) % (1 << 64), batch_index).to(lifted)
     carried = noise_mod.implied_noise(state_streams[0].to(device), x0_streams[0].to(device), sigma_k)
     eps = noise_mod.mix(fresh, carried, s.noise_keep).to(lifted)
     video_next = sigma_next * eps + (1.0 - sigma_next) * lifted
-    ratio = (sigma_next - sigma_k) / sigma_k
-    others_next = [st.to(device) + (st.to(device) - d.to(device)) * ratio
-                   for st, d in zip(state_streams[1:], x0_streams[1:])]
+    # bring the video into latent format through the pack (the audio placeholders are dropped right after)
     ms = model.get_model_object("model_sampling")
-    resume = [ms.inverse_noise_scaling(torch.tensor(sigma_next), x) for x in [video_next] + others_next]
-    resume_latent = model.model.process_latent_out(_pack(resume, nested))
+    pack = [ms.inverse_noise_scaling(torch.tensor(sigma_next), x)
+            for x in [video_next] + [st.to(device) for st in state_streams[1:]]]
+    video_resume = _streams(model.model.process_latent_out(_pack(pack, nested)))[0][0]
+    resume = [video_resume.to(device)] + audio_resume
+    resume_latent = _pack(resume, nested)
     resume_noise = _pack([torch.zeros_like(x) for x in resume], nested)
     logging.info("%s hand-over %.1fs (noise std %.3f)", LOG, time.perf_counter() - t_lift, eps.std().item())
     low_preview = {"samples": x0_video_low.cpu()}
     lifted_preview = {"samples": latent_format.process_out(lifted).cpu()}
-    del state, x0, state_streams, x0_streams, carried, fresh, eps, video_next, others_next, resume
+    del state, x0, state_streams, x0_streams, carried, fresh, eps, video_next, pack, video_resume, audio_resume, resume
 
     # 4. full-res finish
     high_log = _StepLog("full", sigmas[k:], model, k, total, preview)
